@@ -823,10 +823,20 @@ Resources:
           Value: prism-local
 
   # ===========================================================================
+  # ECS SERVICE LINKED ROLE
+  # ===========================================================================
+  ECSServiceLinkedRole:
+    Type: AWS::IAM::ServiceLinkedRole
+    Properties:
+      AWSServiceName: ecs.amazonaws.com
+      Description: Service-linked role for Amazon ECS
+
+  # ===========================================================================
   # ECS CLUSTER
   # ===========================================================================
   ECSCluster:
     Type: AWS::ECS::Cluster
+    DependsOn: ECSServiceLinkedRole
     Properties:
       ClusterName: prism-cluster
       ClusterSettings:
@@ -941,8 +951,8 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
-      Cpu: '512'
-      Memory: '1024'
+      Cpu: '256'
+      Memory: '512'
       ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
       RuntimePlatform:
         CpuArchitecture: X86_64
@@ -1156,8 +1166,8 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
-      Cpu: '512'
-      Memory: '1024'
+      Cpu: '256'
+      Memory: '512'
       ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
       RuntimePlatform:
         CpuArchitecture: X86_64

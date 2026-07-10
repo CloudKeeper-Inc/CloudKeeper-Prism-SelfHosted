@@ -1,0 +1,1622 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CK Prism Application Stack - VPC, RDS Aurora, ECS Fargate, ALB'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  BaseDomain:
+    Type: String
+    Description: 'Base domain for the application (e.g., prism.cloudkeeper.com)'
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must be a valid domain name'
+
+  AppName:
+    Type: String
+    Description: 'Application name (used for APP_NAME, role prefix, SAML provider)'
+    Default: 'CKPrism'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    ConstraintDescription: 'Must start with letter, alphanumeric only'
+
+  AWSSwitchRoleName:
+    Type: String
+    Description: 'IAM role name for AWS switch role'
+    Default: 'CloudKeeper-SSO-Role'
+
+  ACMCertificateArn:
+    Type: String
+    Description: 'ARN of the ACM certificate for HTTPS listeners'
+    AllowedPattern: '^arn:aws:acm:[a-z0-9-]+:[0-9]+:certificate/[a-f0-9-]+$'
+    ConstraintDescription: 'Must be a valid ACM certificate ARN'
+
+  KeycloakAdminUsername:
+    Type: String
+    Description: 'Keycloak admin username'
+    Default: 'admin'
+    NoEcho: false
+
+  KeycloakAdminPassword:
+    Type: String
+    Description: 'Keycloak admin password'
+    NoEcho: true
+    MinLength: 8
+
+# =============================================================================
+# MAPPINGS
+# =============================================================================
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    PublicSubnet1:
+      CIDR: '10.0.0.0/24'
+    PublicSubnet2:
+      CIDR: '10.0.1.0/24'
+    PrivateSubnet1:
+      CIDR: '10.0.10.0/24'
+    PrivateSubnet2:
+      CIDR: '10.0.11.0/24'
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # VPC AND NETWORKING
+  # ===========================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [SubnetConfig, VPC, CIDR]
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: prism-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: prism-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      CidrBlock: !FindInMap [SubnetConfig, PublicSubnet1, CIDR]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: prism-subnet-public1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub '${AWS::Region}b'
+      CidrBlock: !FindInMap [SubnetConfig, PublicSubnet2, CIDR]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: prism-subnet-public2
+
+  # Private Subnets
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      CidrBlock: !FindInMap [SubnetConfig, PrivateSubnet1, CIDR]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: prism-subnet-private1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub '${AWS::Region}b'
+      CidrBlock: !FindInMap [SubnetConfig, PrivateSubnet2, CIDR]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: prism-subnet-private2
+
+  # NAT Gateway
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: prism-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: prism-nat
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: prism-rt-public
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: prism-rt-private
+
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # ===========================================================================
+  # SECURITY GROUPS
+  # ===========================================================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: prism-alb-sg
+      GroupDescription: Security group for Prism Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 8060
+          ToPort: 8060
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 8070
+          ToPort: 8070
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 8090
+          ToPort: 8090
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 9090
+          ToPort: 9090
+          CidrIp: '0.0.0.0/0'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: prism-alb-sg
+
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: prism-frontend-sg
+      GroupDescription: Security group for Frontend ECS service
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: prism-frontend-sg
+
+  KeycloakSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: prism-keycloak-sg
+      GroupDescription: Security group for Keycloak ECS service
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: prism-keycloak-sg
+
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: prism-backend-sg
+      GroupDescription: Security group for Backend ECS service
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8090
+          ToPort: 8091
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: prism-backend-sg
+
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: prism-proxy-sg
+      GroupDescription: Security group for Proxy ECS service
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8060
+          ToPort: 8060
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: prism-proxy-sg
+
+  ScimSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: prism-scim-sg
+      GroupDescription: Security group for SCIM ECS service
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8070
+          ToPort: 8070
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 9090
+          ToPort: 9090
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: prism-scim-sg
+
+  CliBrokerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: prism-cli-broker-sg
+      GroupDescription: Security group for CLI Broker ECS service
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: prism-cli-broker-sg
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: prism-database-sg
+      GroupDescription: Security group for RDS Aurora cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref KeycloakSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ProxySecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ScimSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref CliBrokerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: prism-database-sg
+
+  # Service-to-Service Security Group Rules
+  KeycloakIngressFromBackend:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref KeycloakSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref BackendSecurityGroup
+
+  KeycloakIngressFromProxy:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref KeycloakSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref ProxySecurityGroup
+
+  KeycloakIngressFromScim:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref KeycloakSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref ScimSecurityGroup
+
+  KeycloakIngressFromCliBroker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref KeycloakSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref CliBrokerSecurityGroup
+
+  ScimIngressFromBackend:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ScimSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      SourceSecurityGroupId: !Ref BackendSecurityGroup
+
+  BackendIngressFromProxy:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8090
+      ToPort: 8091
+      SourceSecurityGroupId: !Ref ProxySecurityGroup
+
+  BackendIngressFromScim:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8090
+      ToPort: 8091
+      SourceSecurityGroupId: !Ref ScimSecurityGroup
+
+  BackendIngressFromCliBroker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8090
+      ToPort: 8091
+      SourceSecurityGroupId: !Ref CliBrokerSecurityGroup
+
+  # ===========================================================================
+  # SECRETS MANAGER
+  # ===========================================================================
+  KeycloakAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: prism/keycloak-admin
+      Description: Keycloak admin credentials for Prism
+      SecretString: !Sub |
+        {
+          "username": "${KeycloakAdminUsername}",
+          "password": "${KeycloakAdminPassword}"
+        }
+      Tags:
+        - Key: Name
+          Value: prism-keycloak-admin-secret
+
+  # ===========================================================================
+  # RDS AURORA
+  # ===========================================================================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Prism Aurora cluster
+      DBSubnetGroupName: prism-db-subnet-group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: prism-db-subnet-group
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: prism-aurora-cluster
+      Engine: aurora-mysql
+      EngineVersion: '8.0.mysql_aurora.3.04.1'
+      DatabaseName: prism
+      MasterUsername: admin
+      ManageMasterUserPassword: true
+      Port: 3306
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+      EnableCloudwatchLogsExports:
+        - audit
+        - error
+        - slowquery
+      StorageEncrypted: true
+      Tags:
+        - Key: Name
+          Value: prism-aurora-cluster
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: prism-aurora-instance-1
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.t4g.medium
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: prism-aurora-instance-1
+
+  # ===========================================================================
+  # APPLICATION LOAD BALANCER
+  # ===========================================================================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: prism-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: prism-alb
+
+  # Target Groups
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: prism-frontend-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: prism-frontend-tg
+
+  KeycloakTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: prism-keycloak-tg
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200,302'
+      Tags:
+        - Key: Name
+          Value: prism-keycloak-tg
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: prism-backend-tg
+      Port: 8090
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: prism-backend-tg
+
+  ProxyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: prism-proxy-tg
+      Port: 8060
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: prism-proxy-tg
+
+  ScimTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: prism-scim-tg
+      Port: 8070
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: prism-scim-tg
+
+  CliBrokerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: prism-cli-broker-tg
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: prism-cli-broker-tg
+
+  # Listeners
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            StatusCode: HTTP_301
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref ACMCertificateArn
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '404'
+            ContentType: text/plain
+            MessageBody: 'Not Found'
+
+  ProxyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 8060
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref ACMCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProxyTargetGroup
+
+  ScimListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 8070
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref ACMCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ScimTargetGroup
+
+  BackendListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 8090
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref ACMCertificateArn
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '503'
+            ContentType: text/plain
+
+  # Listener Rules for HTTPS:443
+  CLIBrokerListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 1
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Sub 'cli.${BaseDomain}'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref CliBrokerTargetGroup
+
+  KeycloakListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 5
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Sub 'login.${BaseDomain}'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref KeycloakTargetGroup
+
+  FrontendListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 10
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Ref BaseDomain
+              - !Sub '*.${BaseDomain}'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  # Listener Rules for HTTPS:8090
+  BackendListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref BackendListener
+      Priority: 5
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Ref BaseDomain
+              - !Sub '*.${BaseDomain}'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  # ===========================================================================
+  # CLOUD MAP (SERVICE DISCOVERY)
+  # ===========================================================================
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Properties:
+      Name: prism-local
+      Description: Service discovery namespace for Prism ECS services
+      Tags:
+        - Key: Name
+          Value: prism-local
+
+  # ===========================================================================
+  # ECS CLUSTER
+  # ===========================================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: prism-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enhanced
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ServiceConnectDefaults:
+        Namespace: !GetAtt ServiceDiscoveryNamespace.Arn
+      Tags:
+        - Key: Name
+          Value: prism-cluster
+
+  # ===========================================================================
+  # IAM ROLES
+  # ===========================================================================
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: prism-ecs-task-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref KeycloakAdminSecret
+                  # Wildcard for RDS managed secrets to avoid circular dependency
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: prism-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/IAMFullAccess
+        - arn:aws:iam::aws:policy/IAMAccessAnalyzerFullAccess
+      Policies:
+        - PolicyName: ECSExec
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+        - PolicyName: CrossAccountAssumeRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: '*'
+        - PolicyName: S3LogExport
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: '*'
+
+  # ===========================================================================
+  # ECS TASK DEFINITIONS
+  # ===========================================================================
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: prism-frontend
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: frontend
+          Image: cloudkeeperinc/prism-fe:2.0.0
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: tcp
+              Name: frontend-port
+              AppProtocol: http
+          Environment:
+            - Name: REACT_APP_BASE_DOMAIN
+              Value: !Ref BaseDomain
+            - Name: REACT_APP_KEYCLOAK_DOMAIN
+              Value: !Sub 'login.${BaseDomain}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/prism-frontend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'ps aux | grep -v grep | grep -q ''node\|nginx\|httpd'' || exit 1'
+            Interval: 20
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+
+  KeycloakTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: prism-keycloak
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '1024'
+      Memory: '2048'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: keycloak
+          Image: cloudkeeperinc/prism-keywrap:2.0.0
+          Essential: true
+          Command:
+            - start
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+              Protocol: tcp
+              Name: api-port
+              AppProtocol: http
+            - ContainerPort: 9000
+              HostPort: 9000
+              Protocol: tcp
+              Name: admin-web-portal
+              AppProtocol: http
+          Environment:
+            - Name: KC_DB
+              Value: mysql
+            - Name: KC_DB_URL_HOST
+              Value: !GetAtt AuroraCluster.Endpoint.Address
+            - Name: KC_DB_URL_PORT
+              Value: '3306'
+            - Name: KC_DB_URL_DATABASE
+              Value: prism
+            - Name: KC_HOSTNAME
+              Value: !Sub 'https://login.${BaseDomain}'
+            - Name: KC_PROXY
+              Value: edge
+            - Name: KC_PROXY_ADDRESS_FORWARDING
+              Value: 'true'
+            - Name: KC_HTTP_ENABLED
+              Value: 'true'
+            - Name: KC_HTTP_MAX_QUEUED_REQUESTS
+              Value: '1000'
+            - Name: KC_HEALTH_ENABLED
+              Value: 'true'
+            - Name: KC_METRICS_ENABLED
+              Value: 'true'
+          Secrets:
+            - Name: KC_DB_USERNAME
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:username::'
+            - Name: KC_DB_PASSWORD
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:password::'
+            - Name: KEYCLOAK_ADMIN
+              ValueFrom: !Sub '${KeycloakAdminSecret}:username::'
+            - Name: KEYCLOAK_ADMIN_PASSWORD
+              ValueFrom: !Sub '${KeycloakAdminSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/prism-keycloak
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "exec 3<>/dev/tcp/127.0.0.1/9000; echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; if [ $? -eq 0 ]; then exit 0; else exit 1; fi"
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 60
+
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: prism-backend
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '2048'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: backend
+          Image: cloudkeeperinc/prism-be:2.0.0
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8090
+              HostPort: 8090
+              Protocol: tcp
+              Name: backend-port
+              AppProtocol: http
+            - ContainerPort: 8091
+              HostPort: 8091
+              Protocol: tcp
+              Name: admin-port
+              AppProtocol: http
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: PORT
+              Value: '8090'
+            - Name: DB_HOST
+              Value: !GetAtt AuroraCluster.Endpoint.Address
+            - Name: DB_PORT
+              Value: '3306'
+            - Name: DB_NAME
+              Value: prism
+            - Name: DB_TYPE
+              Value: mysql
+            - Name: KEYCLOAK_URL
+              Value: http://keycloak:8080
+            - Name: KEYCLOAK_HOSTNAME
+              Value: !Sub 'login.${BaseDomain}'
+            - Name: KEYCLOAK_DOMAIN
+              Value: !Sub 'login.${BaseDomain}'
+            - Name: KEYCLOAK_REALM
+              Value: aws-sso
+            - Name: KEYCLOAK_ADMIN_REALM
+              Value: master
+            - Name: KEYCLOAK_CLIENT_ID
+              Value: aws-console
+            - Name: APP_NAME
+              Value: !Ref AppName
+            - Name: AWS_SAML_PROVIDER_NAME
+              Value: !Sub '${AppName}Provider'
+            - Name: AWS_SWITCH_ROLE_NAME
+              Value: !Ref AWSSwitchRoleName
+            - Name: JWT_SECRET
+              Value: cloudkeeperprism
+            - Name: SCIM_BASE_URL
+              Value: http://scim:9090
+            - Name: OPS_SERVICE_URL
+              Value: !Sub 'https://ops.prism.cloudkeeper.com'
+            - Name: JIT_PORTAL_BASE_URL
+              Value: !Sub 'https://jit.${BaseDomain}'
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:password::'
+            - Name: KEYCLOAK_ADMIN_USER
+              ValueFrom: !Sub '${KeycloakAdminSecret}:username::'
+            - Name: KEYCLOAK_ADMIN_PASS
+              ValueFrom: !Sub '${KeycloakAdminSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/prism-backend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - wget --no-verbose --tries=1 --spider http://localhost:8090/health || exit 1
+            Interval: 20
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+
+  ProxyTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: prism-proxy
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: keywrap-proxy
+          Image: cloudkeeperinc/prism-proxy:2.0.0
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8060
+              HostPort: 8060
+              Protocol: tcp
+              Name: proxy-port
+              AppProtocol: http
+          Environment:
+            - Name: HOSTNAME
+              Value: !Ref BaseDomain
+            - Name: DB_HOST
+              Value: !GetAtt AuroraCluster.Endpoint.Address
+            - Name: DB_NAME
+              Value: prism
+          Secrets:
+            - Name: DB_USER
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:password::'
+            - Name: KEYCLOAK_ADMIN_USER
+              ValueFrom: !Sub '${KeycloakAdminSecret}:username::'
+            - Name: KEYCLOAK_ADMIN_PASS
+              ValueFrom: !Sub '${KeycloakAdminSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/prism-proxy
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - wget --no-verbose --tries=1 --spider http://localhost:8060/health || exit 1
+            Interval: 20
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+
+  ScimTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: prism-scim
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: ckauth-scim
+          Image: cloudkeeperinc/prism-scim:2.0.0
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8070
+              HostPort: 8070
+              Protocol: tcp
+              Name: scim-port
+              AppProtocol: http
+            - ContainerPort: 9090
+              HostPort: 9090
+              Protocol: tcp
+              Name: scim-admin-port
+              AppProtocol: http
+          Environment:
+            - Name: PORT
+              Value: '8070'
+            - Name: ADMIN_PORT
+              Value: '9090'
+            - Name: BASE_DOMAIN
+              Value: !Ref BaseDomain
+            - Name: DB_HOST
+              Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+            - Name: DB_PORT
+              Value: '3306'
+            - Name: DB_NAME
+              Value: prism
+            - Name: KEYCLOAK_URL
+              Value: http://keycloak:8080
+            - Name: KEYCLOAK_REALM
+              Value: aws-sso
+            - Name: KEYCLOAK_CLIENT_ID
+              Value: admin-cli
+          Secrets:
+            - Name: DB_USER
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:password::'
+            - Name: KEYCLOAK_USERNAME
+              ValueFrom: !Sub '${KeycloakAdminSecret}:username::'
+            - Name: KEYCLOAK_PASSWORD
+              ValueFrom: !Sub '${KeycloakAdminSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/prism-scim
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - wget --no-verbose --tries=1 --spider http://localhost:8070/health || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 20
+
+  CliBrokerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: prism-cli-broker
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: cli-broker
+          Image: cloudkeeperinc/prism-cli-broker:2.0.0
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+              Protocol: tcp
+              Name: cli-broker
+              AppProtocol: http
+          Environment:
+            - Name: PORT
+              Value: '8080'
+            - Name: DB_HOST
+              Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+            - Name: DB_PORT
+              Value: '3306'
+            - Name: DB_NAME
+              Value: prism
+            - Name: KEYCLOAK_URL
+              Value: http://keycloak:8080
+            - Name: PUBLIC_CLIENT_ID
+              Value: ckauth-cli
+            - Name: CONFIDENTIAL_CLIENT_ID
+              Value: ckauth-cli-broker
+            - Name: USER_ROLE_CLIENT_ID
+              Value: aws-console
+            - Name: APP_NAME_LOWER
+              Value: !Ref AppName
+            - Name: ROLE_PREFIX
+              Value: !Sub '${AppName}-'
+            - Name: SUBJECT_TOKEN_TYPE
+              Value: 'urn:ietf:params:oauth:token-type:access_token'
+            - Name: REQUESTED_TOKEN_TYPE
+              Value: 'urn:ietf:params:oauth:token-type:id_token'
+            - Name: BACKEND_ADMIN_URL
+              Value: http://backend-admin:8091
+          Secrets:
+            - Name: DB_USER
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${AuroraCluster.MasterUserSecret.SecretArn}:password::'
+            - Name: KEYCLOAK_ADMIN_USERNAME
+              ValueFrom: !Sub '${KeycloakAdminSecret}:username::'
+            - Name: KEYCLOAK_ADMIN_PASSWORD
+              ValueFrom: !Sub '${KeycloakAdminSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/prism-cli-broker
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+            Interval: 20
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 20
+
+  # ===========================================================================
+  # ECS SERVICES
+  # ===========================================================================
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - FrontendListenerRule
+    Properties:
+      ServiceName: frontend-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref FrontendSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 80
+          TargetGroupArn: !Ref FrontendTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      # Service Connect temporarily disabled - enable after initial stack creation
+      ServiceConnectConfiguration:
+        Enabled: false
+
+  KeycloakService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - KeycloakListenerRule
+      - AuroraInstance
+    Properties:
+      ServiceName: keycloak-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref KeycloakTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref KeycloakSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      LoadBalancers:
+        - ContainerName: keycloak
+          ContainerPort: 8080
+          TargetGroupArn: !Ref KeycloakTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      # Keycloak Service Connect enabled - other services need to discover it
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt ServiceDiscoveryNamespace.Arn
+        Services:
+          - PortName: api-port
+            ClientAliases:
+              - Port: 8080
+                DnsName: keycloak
+
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - BackendListenerRule
+      - AuroraInstance
+      - KeycloakService
+    Properties:
+      ServiceName: backend-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref BackendSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 8090
+          TargetGroupArn: !Ref BackendTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      # Service Connect enabled - registers backend:8090 and backend-admin:8091
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt ServiceDiscoveryNamespace.Arn
+        Services:
+          - PortName: backend-port
+            ClientAliases:
+              - Port: 8090
+                DnsName: backend
+          - PortName: admin-port
+            ClientAliases:
+              - Port: 8091
+                DnsName: backend-admin
+
+  ProxyService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ProxyListener
+      - AuroraInstance
+      - KeycloakService
+    Properties:
+      ServiceName: proxy-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ProxyTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ProxySecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      LoadBalancers:
+        - ContainerName: keywrap-proxy
+          ContainerPort: 8060
+          TargetGroupArn: !Ref ProxyTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      # Service Connect client-only - can discover keycloak but doesn't register services
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt ServiceDiscoveryNamespace.Arn
+
+  ScimService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ScimListener
+      - AuroraInstance
+      - KeycloakService
+    Properties:
+      ServiceName: scim-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ScimTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ScimSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      LoadBalancers:
+        - ContainerName: ckauth-scim
+          ContainerPort: 8070
+          TargetGroupArn: !Ref ScimTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      # Service Connect enabled - registers scim:9090 for internal discovery
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt ServiceDiscoveryNamespace.Arn
+        Services:
+          - PortName: scim-admin-port
+            ClientAliases:
+              - Port: 9090
+                DnsName: scim
+
+  CliBrokerService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - CLIBrokerListenerRule
+      - AuroraInstance
+      - KeycloakService
+    Properties:
+      ServiceName: cli-broker-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref CliBrokerTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref CliBrokerSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      LoadBalancers:
+        - ContainerName: cli-broker
+          ContainerPort: 8080
+          TargetGroupArn: !Ref CliBrokerTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      # Service Connect client-only - can discover keycloak but doesn't register services
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt ServiceDiscoveryNamespace.Arn
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  ALBDNSName:
+    Description: Application Load Balancer DNS Name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBDNSName'
+
+  AuroraClusterEndpoint:
+    Description: Aurora Cluster Writer Endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraEndpoint'
+
+  AuroraClusterReaderEndpoint:
+    Description: Aurora Cluster Reader Endpoint
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraReaderEndpoint'
+
+  AuroraSecretArn:
+    Description: Aurora Master User Secret ARN
+    Value: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraSecretArn'
+
+  KeycloakSecretArn:
+    Description: Keycloak Admin Secret ARN
+    Value: !Ref KeycloakAdminSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-KeycloakSecretArn'
+
+  FrontendURL:
+    Description: Frontend Application URL
+    Value: !Sub 'https://${BaseDomain}'
+
+  AvailabilityZones:
+    Description: Availability Zones used by this stack
+    Value: !Sub '${AWS::Region}a, ${AWS::Region}b'
